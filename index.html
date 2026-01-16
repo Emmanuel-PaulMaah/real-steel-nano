@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Real Steel Tiny Demo</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0f14; color: #e8eef7; font-family: system-ui, sans-serif; }
+    #wrap { display: grid; grid-template-rows: auto 1fr auto; height: 100%; }
+    header, footer { padding: 10px 12px; }
+    header { display:flex; gap:12px; align-items:center; flex-wrap: wrap; }
+    button { background:#1b2430; color:#e8eef7; border:1px solid #2a3a4e; padding:8px 10px; border-radius:10px; cursor:pointer; }
+    button:hover { border-color:#3d5876; }
+    .pill { padding:6px 10px; border:1px solid #2a3a4e; border-radius:999px; background:#111826; font-size: 13px; }
+    canvas { width: 100%; height: 100%; display:block; }
+    .kbd { opacity: .85; font-size: 13px; line-height: 1.4; }
+    code { background:#111826; padding:2px 6px; border-radius: 6px; border:1px solid #223246; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <header>
+    <button id="micBtn">🎙️ Start voice</button>
+    <span class="pill" id="micStatus">mic: off</span>
+    <span class="pill" id="statePill">state: idle</span>
+    <span class="pill" id="lastCmd">last: —</span>
+  </header>
+
+  <canvas id="c"></canvas>
+
+  <footer class="kbd">
+    Voice: “left / right / jab / hook / punch / kick / block / guard / idle / reset / combo”<br/>
+    Keyboard: <code>A</code>/<code>D</code> move, <code>J</code> jab, <code>K</code> hook, <code>L</code> kick, <code>Space</code> block, <code>R</code> reset
+  </footer>
+</div>
+
+<script>
+(() => {
+  // ---------- Canvas setup ----------
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  function resize() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(canvas.clientWidth * dpr);
+    canvas.height = Math.floor(canvas.clientHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- UI ----------
+  const micBtn = document.getElementById('micBtn');
+  const micStatus = document.getElementById('micStatus');
+  const statePill = document.getElementById('statePill');
+  const lastCmdEl = document.getElementById('lastCmd');
+  function setLast(cmd) { lastCmdEl.textContent = `last: ${cmd}`; }
+
+  // ---------- Fighter model ----------
+  const fighter = {
+    x: 200,
+    y: 0,      // ground handled in draw
+    dir: 1,    // 1 facing right
+    state: 'idle',
+    t: 0,      // state time
+    lock: 0,   // action lock time remaining
+    queued: null,
+    hitFlash: 0
+  };
+
+  function setState(name, duration) {
+    fighter.state = name;
+    fighter.t = 0;
+    fighter.lock = duration || 0;
+    statePill.textContent = `state: ${name}`;
+  }
+
+  function queueOrRun(actionFn) {
+    if (fighter.lock > 0) {
+      fighter.queued = actionFn; // keep only 1 queued (tiny MVP)
+      return;
+    }
+    actionFn();
+  }
+
+  // ---------- Actions ----------
+  const ACTIONS = {
+    left: () => queueOrRun(() => { fighter.x -= 40; setState('step', 0.18); }),
+    right: () => queueOrRun(() => { fighter.x += 40; setState('step', 0.18); }),
+    reset: () => { fighter.x = 200; fighter.hitFlash = 0; fighter.queued = null; setState('idle', 0); },
+    idle: () => queueOrRun(() => setState('idle', 0)),
+    block: () => queueOrRun(() => setState('guard', 0.6)),
+    guard: () => queueOrRun(() => setState('guard', 0.6)),
+    jab: () => queueOrRun(() => { setState('jab', 0.28); fighter.hitFlash = 0.15; }),
+    punch: () => queueOrRun(() => { setState('punch', 0.38); fighter.hitFlash = 0.18; }),
+    hook: () => queueOrRun(() => { setState('hook', 0.48); fighter.hitFlash = 0.22; }),
+    kick: () => queueOrRun(() => { setState('kick', 0.55); fighter.hitFlash = 0.22; }),
+    combo: () => queueOrRun(() => {
+      // very tiny scripted combo
+      setState('jab', 0.28);
+      fighter.queued = () => {
+        setState('jab', 0.28);
+        fighter.queued = () => setState('hook', 0.48);
+      };
+      fighter.hitFlash = 0.3;
+    }),
+  };
+
+  function runCommand(raw) {
+    const cmd = normalizeCmd(raw);
+    if (!cmd) return;
+    setLast(cmd);
+    const fn = ACTIONS[cmd];
+    if (fn) fn();
+  }
+
+  // ---------- Command normalization ----------
+  function normalizeCmd(text) {
+    if (!text) return null;
+    const t = text.toLowerCase().trim();
+
+    // Basic synonym mapping (keep small; expand later)
+    const map = new Map([
+      ['go left','left'], ['move left','left'], ['step left','left'], ['left','left'],
+      ['go right','right'], ['move right','right'], ['step right','right'], ['right','right'],
+      ['jab','jab'], ['job','jab'], // common mishear
+      ['punch','punch'],
+      ['hook','hook'],
+      ['kick','kick'],
+      ['block','block'], ['guard','guard'],
+      ['idle','idle'], ['reset','reset'],
+      ['combo','combo'],
+    ]);
+
+    if (map.has(t)) return map.get(t);
+
+    // If phrase contains known word
+    for (const key of ['left','right','jab','punch','hook','kick','block','guard','reset','idle','combo']) {
+      if (t.includes(key)) return key;
+    }
+    return null;
+  }
+
+  // ---------- Speech Recognition ----------
+  let recognition = null;
+  let listening = false;
+
+  function setupSpeech() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return null;
+
+    const rec = new SR();
+    rec.lang = 'en-US';
+    rec.interimResults = false;
+    rec.continuous = true;
+
+    rec.onresult = (e) => {
+      // Take the most recent final transcript
+      const res = e.results[e.results.length - 1];
+      if (!res || !res[0]) return;
+      runCommand(res[0].transcript);
+    };
+
+    rec.onerror = (e) => {
+      micStatus.textContent = `mic: error (${e.error})`;
+      // common: "not-allowed", "service-not-allowed", "no-speech"
+    };
+
+    rec.onend = () => {
+      // Chrome likes to end sessions. If user wants listening, restart.
+      if (listening) {
+        try { rec.start(); } catch {}
+      }
+    };
+
+    return rec;
+  }
+
+  function startVoice() {
+    if (!recognition) recognition = setupSpeech();
+    if (!recognition) {
+      micStatus.textContent = 'mic: unsupported (try Chrome)';
+      return;
+    }
+    listening = true;
+    micStatus.textContent = 'mic: on';
+    micBtn.textContent = '🛑 Stop voice';
+    try { recognition.start(); } catch {}
+  }
+
+  function stopVoice() {
+    listening = false;
+    micStatus.textContent = 'mic: off';
+    micBtn.textContent = '🎙️ Start voice';
+    if (recognition) {
+      try { recognition.stop(); } catch {}
+    }
+  }
+
+  micBtn.addEventListener('click', () => {
+    if (listening) stopVoice();
+    else startVoice();
+  });
+
+  // ---------- Keyboard fallback ----------
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat) return;
+    const k = e.key.toLowerCase();
+    if (k === 'a') runCommand('left');
+    if (k === 'd') runCommand('right');
+    if (k === 'j') runCommand('jab');
+    if (k === 'k') runCommand('hook');
+    if (k === 'l') runCommand('kick');
+    if (k === ' ') runCommand('block');
+    if (k === 'r') runCommand('reset');
+  });
+
+  // ---------- Animation / draw ----------
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function drawStickRobot(cx, groundY, s) {
+    // base proportions
+    const headR = 14;
+    const torso = 50;
+    const hip = 18;
+    const arm = 32;
+    const fore = 26;
+    const leg = 38;
+    const shin = 34;
+
+    // state progress (0..1)
+    const p = s.lock > 0 ? clamp(s.t / s.lock, 0, 1) : 0;
+
+    // pose params
+    let leftShoulder = -0.4, rightShoulder = 0.4;
+    let leftElbow = -0.6, rightElbow = 0.6;
+    let leftHip = -0.2, rightHip = 0.2;
+    let leftKnee = 0.2, rightKnee = 0.2;
+
+    if (s.state === 'guard') {
+      leftShoulder = -1.1; rightShoulder = -2.0;
+      leftElbow = -0.2; rightElbow = -0.5;
+    }
+
+    if (s.state === 'jab') {
+      // extend right arm quickly
+      const t = Math.sin(p * Math.PI);
+      rightShoulder = lerp(0.2, -0.4, t);
+      rightElbow = lerp(0.5, -0.1, t);
+    }
+
+    if (s.state === 'punch') {
+      const t = Math.sin(p * Math.PI);
+      rightShoulder = lerp(0.3, -0.2, t);
+      rightElbow = lerp(0.7, -0.25, t);
+    }
+
+    if (s.state === 'hook') {
+      const t = Math.sin(p * Math.PI);
+      rightShoulder = lerp(0.4, -1.2, t);
+      rightElbow = lerp(0.6, -0.6, t);
+    }
+
+    if (s.state === 'kick') {
+      const t = Math.sin(p * Math.PI);
+      rightHip = lerp(0.2, -0.9, t);
+      rightKnee = lerp(0.2, -0.6, t);
+    }
+
+    if (s.state === 'step') {
+      const t = Math.sin(p * Math.PI);
+      leftHip = lerp(-0.2, -0.6, t);
+      rightHip = lerp(0.2, 0.6, t);
+    }
+
+    // draw helpers
+    function line(x1,y1,x2,y2) { ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); }
+    function joint(x,y,r=4) { ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); }
+
+    // style
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#d6e3ff';
+    ctx.fillStyle = '#d6e3ff';
+
+    // body anchors
+    const neckX = cx;
+    const neckY = groundY - (torso + hip + leg + shin) + 20;
+    const headX = neckX;
+    const headY = neckY - 22;
+
+    const shoulderX = neckX;
+    const shoulderY = neckY + 10;
+    const hipX = neckX;
+    const hipY = shoulderY + torso;
+
+    // head
+    ctx.beginPath();
+    ctx.arc(headX, headY, headR, 0, Math.PI*2);
+    ctx.stroke();
+
+    // torso + hips
+    line(shoulderX, shoulderY, hipX, hipY);
+    line(hipX - 18, hipY, hipX + 18, hipY);
+
+    // arms
+    function armChain(sideSign, shoulderAng, elbowAng) {
+      const sx = shoulderX + sideSign*14;
+      const sy = shoulderY + 2;
+
+      const ex = sx + Math.cos(shoulderAng)*arm;
+      const ey = sy + Math.sin(shoulderAng)*arm;
+
+      const wx = ex + Math.cos(elbowAng)*fore;
+      const wy = ey + Math.sin(elbowAng)*fore;
+
+      line(sx, sy, ex, ey);
+      line(ex, ey, wx, wy);
+      joint(sx, sy); joint(ex, ey); joint(wx, wy, 3);
+      return { handX: wx, handY: wy };
+    }
+
+    const leftHand = armChain(-1, leftShoulder, leftElbow);
+    const rightHand = armChain(1, rightShoulder, rightElbow);
+
+    // legs
+    function legChain(sideSign, hipAng, kneeAng) {
+      const hx = hipX + sideSign*10;
+      const hy = hipY + 4;
+
+      const kx = hx + Math.cos(hipAng)*leg;
+      const ky = hy + Math.sin(hipAng)*leg;
+
+      const ax = kx + Math.cos(kneeAng)*shin;
+      const ay = ky + Math.sin(kneeAng)*shin;
+
+      line(hx, hy, kx, ky);
+      line(kx, ky, ax, ay);
+      joint(hx, hy); joint(kx, ky); joint(ax, ay, 3);
+      // foot
+      line(ax, ay, ax + sideSign*14, ay);
+    }
+
+    legChain(-1, leftHip + 1.6, leftKnee + 1.6);
+    legChain(1, rightHip + 1.6, rightKnee + 1.6);
+
+    // simple hit indicator in front of fighter
+    if (s.hitFlash > 0) {
+      const hx = cx + 140;
+      const hy = groundY - 120;
+      ctx.globalAlpha = clamp(s.hitFlash / 0.22, 0, 1);
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(hx, hy, 18, 0, Math.PI*2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 4;
+    }
+  }
+
+  function tick(dt) {
+    // clamp into canvas bounds
+    fighter.x = clamp(fighter.x, 70, canvas.clientWidth - 70);
+
+    fighter.t += dt;
+    if (fighter.lock > 0) {
+      fighter.lock -= dt;
+      if (fighter.lock <= 0) {
+        fighter.lock = 0;
+        if (fighter.queued) {
+          const q = fighter.queued;
+          fighter.queued = null;
+          q();
+        } else {
+          setState('idle', 0);
+        }
+      }
+    }
+
+    if (fighter.hitFlash > 0) fighter.hitFlash = Math.max(0, fighter.hitFlash - dt);
+  }
+
+  function render() {
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    ctx.clearRect(0, 0, w, h);
+
+    // background grid
+    ctx.globalAlpha = 0.6;
+    ctx.strokeStyle = '#1a2736';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < w; x += 40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+    for (let y = 0; y < h; y += 40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+
+    // ground
+    const groundY = h - 80;
+    ctx.strokeStyle = '#2a3a4e';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(0, groundY); ctx.lineTo(w, groundY); ctx.stroke();
+
+    // opponent marker (invisible opponent)
+    ctx.globalAlpha = 0.7;
+    ctx.fillStyle = '#2a3a4e';
+    ctx.fillRect(w - 120, groundY - 160, 18, 160);
+    ctx.globalAlpha = 1;
+
+    // fighter
+    drawStickRobot(fighter.x, groundY, fighter);
+
+    // HUD hint
+    ctx.fillStyle = '#8aa4c7';
+    ctx.font = '14px system-ui, sans-serif';
+    ctx.fillText('Say a command or use keyboard.', 14, 22);
+  }
+
+  // ---------- Game loop ----------
+  resize();
+  setState('idle', 0);
+  let last = performance.now();
+
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    tick(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
