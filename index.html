@@ -29,14 +29,14 @@
   <canvas id="c"></canvas>
 
   <footer class="kbd">
-    Voice: “left / right / jab / hook / punch / kick / block / guard / idle / reset / combo”<br/>
+    Voice: say anything containing: “left / right / jab / hook / punch / kick / block / guard / idle / reset / combo”<br/>
     Keyboard: <code>A</code>/<code>D</code> move, <code>J</code> jab, <code>K</code> hook, <code>L</code> kick, <code>Space</code> block, <code>R</code> reset
   </footer>
 </div>
 
 <script>
 (() => {
-  // ---------- Canvas setup ----------
+  // ---------- Canvas ----------
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
 
@@ -53,91 +53,129 @@
   const micStatus = document.getElementById('micStatus');
   const statePill = document.getElementById('statePill');
   const lastCmdEl = document.getElementById('lastCmd');
-  function setLast(cmd) { lastCmdEl.textContent = `last: ${cmd}`; }
 
-  // ---------- Fighter model ----------
+  function setLast(cmd) {
+    lastCmdEl.textContent = `last: ${cmd || '—'}`;
+  }
+  function setStatePill(s) {
+    statePill.textContent = `state: ${s}`;
+  }
+
+  // ---------- Fighter ----------
   const fighter = {
-    x: 200,
-    y: 0,      // ground handled in draw
-    dir: 1,    // 1 facing right
+    x: 220,
     state: 'idle',
-    t: 0,      // state time
-    lock: 0,   // action lock time remaining
+    t: 0,
+    lock: 0,
     queued: null,
-    hitFlash: 0
+    hitFlash: 0,
   };
 
   function setState(name, duration) {
     fighter.state = name;
     fighter.t = 0;
     fighter.lock = duration || 0;
-    statePill.textContent = `state: ${name}`;
+    setStatePill(name);
   }
 
   function queueOrRun(actionFn) {
     if (fighter.lock > 0) {
-      fighter.queued = actionFn; // keep only 1 queued (tiny MVP)
+      fighter.queued = actionFn; // tiny MVP: keep only 1 queued
       return;
     }
     actionFn();
   }
 
+  // ---------- Floating command caption (above robot) ----------
+  // Shows ONLY when a valid command is detected.
+  const cmdCaption = {
+    text: '',
+    ttl: 0,        // seconds remaining
+    ttlMax: 0.85,  // fade duration
+  };
+
+  function showCommandCaption(cmd) {
+    cmdCaption.text = cmd;
+    cmdCaption.ttl = cmdCaption.ttlMax;
+  }
+
   // ---------- Actions ----------
   const ACTIONS = {
-    left: () => queueOrRun(() => { fighter.x -= 40; setState('step', 0.18); }),
-    right: () => queueOrRun(() => { fighter.x += 40; setState('step', 0.18); }),
-    reset: () => { fighter.x = 200; fighter.hitFlash = 0; fighter.queued = null; setState('idle', 0); },
-    idle: () => queueOrRun(() => setState('idle', 0)),
-    block: () => queueOrRun(() => setState('guard', 0.6)),
-    guard: () => queueOrRun(() => setState('guard', 0.6)),
-    jab: () => queueOrRun(() => { setState('jab', 0.28); fighter.hitFlash = 0.15; }),
+    left:  () => queueOrRun(() => { fighter.x -= 45; setState('step', 0.18); }),
+    right: () => queueOrRun(() => { fighter.x += 45; setState('step', 0.18); }),
+    reset: () => { fighter.x = 220; fighter.hitFlash = 0; fighter.queued = null; setState('idle', 0); },
+    idle:  () => queueOrRun(() => setState('idle', 0)),
+    block: () => queueOrRun(() => setState('guard', 0.60)),
+    guard: () => queueOrRun(() => setState('guard', 0.60)),
+    jab:   () => queueOrRun(() => { setState('jab', 0.28); fighter.hitFlash = 0.15; }),
     punch: () => queueOrRun(() => { setState('punch', 0.38); fighter.hitFlash = 0.18; }),
-    hook: () => queueOrRun(() => { setState('hook', 0.48); fighter.hitFlash = 0.22; }),
-    kick: () => queueOrRun(() => { setState('kick', 0.55); fighter.hitFlash = 0.22; }),
+    hook:  () => queueOrRun(() => { setState('hook', 0.48); fighter.hitFlash = 0.22; }),
+    kick:  () => queueOrRun(() => { setState('kick', 0.55); fighter.hitFlash = 0.22; }),
     combo: () => queueOrRun(() => {
-      // very tiny scripted combo
       setState('jab', 0.28);
       fighter.queued = () => {
         setState('jab', 0.28);
         fighter.queued = () => setState('hook', 0.48);
       };
-      fighter.hitFlash = 0.3;
+      fighter.hitFlash = 0.30;
     }),
   };
 
-  function runCommand(raw) {
-    const cmd = normalizeCmd(raw);
-    if (!cmd) return;
-    setLast(cmd);
-    const fn = ACTIONS[cmd];
-    if (fn) fn();
-  }
+  // ---------- Command detection ----------
+  // Goal: if phrase contains a command word, return ONLY that command.
+  // e.g. "i want it to jab right now" -> "jab"
+  function detectCommand(phrase) {
+    if (!phrase) return null;
+    const t = phrase.toLowerCase().trim();
 
-  // ---------- Command normalization ----------
-  function normalizeCmd(text) {
-    if (!text) return null;
-    const t = text.toLowerCase().trim();
+    // priority order matters: if someone says "go left" we want left, etc.
+    // also include a couple common mishears (jab -> job)
+    const rules = [
+      { cmd: 'reset', words: ['reset'] },
+      { cmd: 'idle',  words: ['idle'] },
 
-    // Basic synonym mapping (keep small; expand later)
-    const map = new Map([
-      ['go left','left'], ['move left','left'], ['step left','left'], ['left','left'],
-      ['go right','right'], ['move right','right'], ['step right','right'], ['right','right'],
-      ['jab','jab'], ['job','jab'], // common mishear
-      ['punch','punch'],
-      ['hook','hook'],
-      ['kick','kick'],
-      ['block','block'], ['guard','guard'],
-      ['idle','idle'], ['reset','reset'],
-      ['combo','combo'],
+      { cmd: 'combo', words: ['combo'] },
+
+      { cmd: 'block', words: ['block'] },
+      { cmd: 'guard', words: ['guard'] },
+
+      { cmd: 'jab',   words: ['jab', 'job'] },
+      { cmd: 'hook',  words: ['hook'] },
+      { cmd: 'punch', words: ['punch'] },
+      { cmd: 'kick',  words: ['kick'] },
+
+      { cmd: 'left',  words: ['left'] },
+      { cmd: 'right', words: ['right'] },
+    ];
+
+    // Exact phrase mapping (optional tiny sugar)
+    const exactMap = new Map([
+      ['go left','left'], ['move left','left'], ['step left','left'],
+      ['go right','right'], ['move right','right'], ['step right','right'],
     ]);
+    if (exactMap.has(t)) return exactMap.get(t);
 
-    if (map.has(t)) return map.get(t);
-
-    // If phrase contains known word
-    for (const key of ['left','right','jab','punch','hook','kick','block','guard','reset','idle','combo']) {
-      if (t.includes(key)) return key;
+    // Word-boundary contains check: avoids matching "right" inside "bright"
+    for (const r of rules) {
+      for (const w of r.words) {
+        const re = new RegExp(`\\b${escapeRegExp(w)}\\b`, 'i');
+        if (re.test(t)) return r.cmd;
+      }
     }
     return null;
+  }
+
+  function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function runDetected(phrase) {
+    const cmd = detectCommand(phrase);
+    if (!cmd) return;                // IMPORTANT: show nothing if no command found
+    setLast(cmd);
+    showCommandCaption(cmd);         // IMPORTANT: show ONLY the command
+    const fn = ACTIONS[cmd];
+    if (fn) fn();
   }
 
   // ---------- Speech Recognition ----------
@@ -154,19 +192,18 @@
     rec.continuous = true;
 
     rec.onresult = (e) => {
-      // Take the most recent final transcript
       const res = e.results[e.results.length - 1];
       if (!res || !res[0]) return;
-      runCommand(res[0].transcript);
+      const transcript = res[0].transcript;
+      runDetected(transcript);
     };
 
     rec.onerror = (e) => {
       micStatus.textContent = `mic: error (${e.error})`;
-      // common: "not-allowed", "service-not-allowed", "no-speech"
     };
 
     rec.onend = () => {
-      // Chrome likes to end sessions. If user wants listening, restart.
+      // Chrome often ends sessions; restart if user still wants listening
       if (listening) {
         try { rec.start(); } catch {}
       }
@@ -205,33 +242,32 @@
   window.addEventListener('keydown', (e) => {
     if (e.repeat) return;
     const k = e.key.toLowerCase();
-    if (k === 'a') runCommand('left');
-    if (k === 'd') runCommand('right');
-    if (k === 'j') runCommand('jab');
-    if (k === 'k') runCommand('hook');
-    if (k === 'l') runCommand('kick');
-    if (k === ' ') runCommand('block');
-    if (k === 'r') runCommand('reset');
+    if (k === 'a') runDetected('left');
+    if (k === 'd') runDetected('right');
+    if (k === 'j') runDetected('jab');
+    if (k === 'k') runDetected('hook');
+    if (k === 'l') runDetected('kick');
+    if (k === ' ') runDetected('block');
+    if (k === 'r') runDetected('reset');
   });
 
-  // ---------- Animation / draw ----------
+  // ---------- Drawing ----------
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
   function lerp(a, b, t) { return a + (b - a) * t; }
 
   function drawStickRobot(cx, groundY, s) {
-    // base proportions
+    // proportions
     const headR = 14;
     const torso = 50;
-    const hip = 18;
+    const hipW = 36;
     const arm = 32;
     const fore = 26;
     const leg = 38;
     const shin = 34;
 
-    // state progress (0..1)
     const p = s.lock > 0 ? clamp(s.t / s.lock, 0, 1) : 0;
 
-    // pose params
+    // default pose
     let leftShoulder = -0.4, rightShoulder = 0.4;
     let leftElbow = -0.6, rightElbow = 0.6;
     let leftHip = -0.2, rightHip = 0.2;
@@ -241,41 +277,31 @@
       leftShoulder = -1.1; rightShoulder = -2.0;
       leftElbow = -0.2; rightElbow = -0.5;
     }
-
     if (s.state === 'jab') {
-      // extend right arm quickly
       const t = Math.sin(p * Math.PI);
       rightShoulder = lerp(0.2, -0.4, t);
       rightElbow = lerp(0.5, -0.1, t);
     }
-
     if (s.state === 'punch') {
       const t = Math.sin(p * Math.PI);
       rightShoulder = lerp(0.3, -0.2, t);
       rightElbow = lerp(0.7, -0.25, t);
     }
-
     if (s.state === 'hook') {
       const t = Math.sin(p * Math.PI);
       rightShoulder = lerp(0.4, -1.2, t);
       rightElbow = lerp(0.6, -0.6, t);
     }
-
     if (s.state === 'kick') {
       const t = Math.sin(p * Math.PI);
       rightHip = lerp(0.2, -0.9, t);
       rightKnee = lerp(0.2, -0.6, t);
     }
-
     if (s.state === 'step') {
       const t = Math.sin(p * Math.PI);
       leftHip = lerp(-0.2, -0.6, t);
       rightHip = lerp(0.2, 0.6, t);
     }
-
-    // draw helpers
-    function line(x1,y1,x2,y2) { ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); }
-    function joint(x,y,r=4) { ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); }
 
     // style
     ctx.lineWidth = 4;
@@ -283,9 +309,11 @@
     ctx.strokeStyle = '#d6e3ff';
     ctx.fillStyle = '#d6e3ff';
 
-    // body anchors
+    function line(x1,y1,x2,y2) { ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); }
+    function joint(x,y,r=4) { ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); }
+
     const neckX = cx;
-    const neckY = groundY - (torso + hip + leg + shin) + 20;
+    const neckY = groundY - (torso + 18 + leg + shin) + 20;
     const headX = neckX;
     const headY = neckY - 22;
 
@@ -301,7 +329,7 @@
 
     // torso + hips
     line(shoulderX, shoulderY, hipX, hipY);
-    line(hipX - 18, hipY, hipX + 18, hipY);
+    line(hipX - hipW/2, hipY, hipX + hipW/2, hipY);
 
     // arms
     function armChain(sideSign, shoulderAng, elbowAng) {
@@ -320,8 +348,8 @@
       return { handX: wx, handY: wy };
     }
 
-    const leftHand = armChain(-1, leftShoulder, leftElbow);
-    const rightHand = armChain(1, rightShoulder, rightElbow);
+    armChain(-1, leftShoulder, leftElbow);
+    armChain(1, rightShoulder, rightElbow);
 
     // legs
     function legChain(sideSign, hipAng, kneeAng) {
@@ -337,14 +365,13 @@
       line(hx, hy, kx, ky);
       line(kx, ky, ax, ay);
       joint(hx, hy); joint(kx, ky); joint(ax, ay, 3);
-      // foot
-      line(ax, ay, ax + sideSign*14, ay);
+      line(ax, ay, ax + sideSign*14, ay); // foot
     }
 
     legChain(-1, leftHip + 1.6, leftKnee + 1.6);
     legChain(1, rightHip + 1.6, rightKnee + 1.6);
 
-    // simple hit indicator in front of fighter
+    // hit indicator (cheap feedback)
     if (s.hitFlash > 0) {
       const hx = cx + 140;
       const hy = groundY - 120;
@@ -358,8 +385,38 @@
     }
   }
 
+  function drawCommandCaption(cx, yTop) {
+    if (cmdCaption.ttl <= 0 || !cmdCaption.text) return;
+
+    const a = clamp(cmdCaption.ttl / cmdCaption.ttlMax, 0, 1); // 1 -> 0
+    const rise = (1 - a) * 28;
+
+    ctx.save();
+    ctx.globalAlpha = a;
+
+    ctx.font = '700 26px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // outline for legibility
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = '#0b0f14';
+    ctx.strokeText(cmdCaption.text.toUpperCase(), cx, yTop - rise);
+
+    ctx.fillStyle = '#e8eef7';
+    ctx.fillText(cmdCaption.text.toUpperCase(), cx, yTop - rise);
+
+    ctx.restore();
+  }
+
+  // ---------- Loop ----------
+  resize();
+  setState('idle', 0);
+  setLast(null);
+
+  let last = performance.now();
+
   function tick(dt) {
-    // clamp into canvas bounds
     fighter.x = clamp(fighter.x, 70, canvas.clientWidth - 70);
 
     fighter.t += dt;
@@ -378,6 +435,7 @@
     }
 
     if (fighter.hitFlash > 0) fighter.hitFlash = Math.max(0, fighter.hitFlash - dt);
+    if (cmdCaption.ttl > 0) cmdCaption.ttl = Math.max(0, cmdCaption.ttl - dt);
   }
 
   function render() {
@@ -385,7 +443,7 @@
     const h = canvas.clientHeight;
     ctx.clearRect(0, 0, w, h);
 
-    // background grid
+    // grid
     ctx.globalAlpha = 0.6;
     ctx.strokeStyle = '#1a2736';
     ctx.lineWidth = 1;
@@ -399,25 +457,25 @@
     ctx.lineWidth = 3;
     ctx.beginPath(); ctx.moveTo(0, groundY); ctx.lineTo(w, groundY); ctx.stroke();
 
-    // opponent marker (invisible opponent)
+    // opponent marker
     ctx.globalAlpha = 0.7;
     ctx.fillStyle = '#2a3a4e';
     ctx.fillRect(w - 120, groundY - 160, 18, 160);
     ctx.globalAlpha = 1;
 
+    // caption position = above head area
+    const captionY = groundY - 220;
+    drawCommandCaption(fighter.x, captionY);
+
     // fighter
     drawStickRobot(fighter.x, groundY, fighter);
 
-    // HUD hint
+    // hint
     ctx.fillStyle = '#8aa4c7';
     ctx.font = '14px system-ui, sans-serif';
-    ctx.fillText('Say a command or use keyboard.', 14, 22);
+    ctx.textAlign = 'left';
+    ctx.fillText('Say a phrase containing a command (e.g. “i want it to jab right now”).', 14, 22);
   }
-
-  // ---------- Game loop ----------
-  resize();
-  setState('idle', 0);
-  let last = performance.now();
 
   function loop(now) {
     const dt = Math.min(0.033, (now - last) / 1000);
